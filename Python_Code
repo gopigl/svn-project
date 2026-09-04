@@ -102,24 +102,22 @@ spec:
 
 
 ========================
-import json, os, struct, urllib.parse, urllib.request, pyodbc
+import java.sql.*;
+import java.util.Properties;
 
-body = urllib.parse.urlencode({
-    "client_id": os.environ["AZURE_CLIENT_ID"],
-    "scope": "https://database.windows.net/.default",
-    "grant_type": "client_credentials",
-    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-    "client_assertion": open(os.environ["AZURE_FEDERATED_TOKEN_FILE"]).read(),
-}).encode()
+public class DbTest {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:sqlserver://test-db-ericsson.database.windows.net:1433"
+                   + ";database=test-db01;encrypt=true;loginTimeout=30";
 
-url = f"{os.environ['AZURE_AUTHORITY_HOST']}{os.environ['AZURE_TENANT_ID']}/oauth2/v2.0/token"
-token = json.load(urllib.request.urlopen(urllib.request.Request(url, data=body)))["access_token"]
+        Properties props = new Properties();
+        props.setProperty("accessToken", System.getenv("TOKEN"));
 
-tb = token.encode("utf-16-le")
-conn = pyodbc.connect(
-    "DRIVER={ODBC Driver 18 for SQL Server};"
-    "SERVER=test-db-ericsson.database.windows.net;"
-    "DATABASE=test-db01;Encrypt=yes;",
-    attrs_before={1256: struct.pack(f"<I{len(tb)}s", len(tb), tb)},
-)
-print(conn.cursor().execute("SELECT SUSER_SNAME(), @@VERSION").fetchone())
+        try (Connection conn = DriverManager.getConnection(url, props);
+             ResultSet rs = conn.createStatement()
+                 .executeQuery("SELECT SUSER_SNAME(), DB_NAME()")) {
+            rs.next();
+            System.out.println("CONNECTED as " + rs.getString(1) + " on " + rs.getString(2));
+        }
+    }
+}
