@@ -6,3 +6,96 @@ curl -fsSL https://packages.microsoft.com/config/mariner/2.0/prod.repo | tee /et
 tdnf install -y msodbcsql18 mssql-tools18
 pip3 install pyodbc
 export PATH="/opt/mssql-tools18/bin:$PATH"
+
+
+
+==================
+# Long-running pod for interactive Azure SQL / Workload Identity testing.
+#
+# It installs msodbcsql18 + pyodbc + azure-identity on startup, then sleeps
+# so you can exec in and paste/run your script by hand.
+#
+# Replace before applying:
+#   <namespace>   namespace matching your federated credential subject
+#   <sa-name>     service account matching your federated credential subject
+#   <server>      e.g. myserver.database.windows.net
+#   <database>    e.g. mydb
+#
+#   kubectl apply -f db-test-pod.yaml
+#   kubectl logs -f db-test -n <namespace>        # wait for "SETUP COMPLETE"
+#   kubectl exec -it db-test -n <namespace> -- bash
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-test
+  namespace: <namespace>
+  labels:
+    # Without this label the webhook injects no credentials and every
+    # token request will fail. Most common cause of failure.
+    azure.workload.identity/use: "true"
+spec:
+  serviceAccountName: <sa-name>
+  restartPolicy: Never
+
+  containers:
+    - name: db-test
+      image: python:3.12-slim
+      workingDir: /work
+
+      env:
+        - name: SQL_SERVER
+          value: "<server>"
+        - name: SQL_DATABASE
+          value: "<database>"
+        - name: DEBIAN_FRONTEND
+          value: noninteractive
+        - name: ACCEPT_EULA
+          value: "Y"
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -euo pipefail
+
+          echo ">>> installing msodbcsql18"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            curl gnupg ca-certificates vim-tiny > /dev/null
+
+          # python:3.12-slim is based on Debian 12 (bookworm)
+          curl -fsSL -o /tmp/ms-prod.deb \
+            https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb
+          dpkg -i /tmp/ms-prod.deb
+
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            msodbcsql18 mssql-tools18 unixodbc unixodbc-dev > /dev/null
+
+          echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> /root/.bashrc
+
+          echo ">>> installing python packages"
+          pip install --quiet --no-cache-dir \
+            "pyodbc>=5.1.0" "azure-identity>=1.19.0"
+
+          echo ">>> odbc drivers:"
+          python -c "import pyodbc; print(pyodbc.drivers())"
+
+          echo ""
+          echo "SETUP COMPLETE - pod is idle, exec in to run your script"
+          sleep infinity
+
+      volumeMounts:
+        - name: work
+          mountPath: /work
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          memory: 768Mi
+
+  volumes:
+    - name: work
+      emptyDir: {}
