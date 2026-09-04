@@ -121,3 +121,12 @@ public class DbTest {
         }
     }
 }
+
+================
+export TOKEN=$(curl -s -X POST "${AZURE_AUTHORITY_HOST}${AZURE_TENANT_ID}/oauth2/v2.0/token" \
+  -d "client_id=${AZURE_CLIENT_ID}" \
+  -d "scope=https://database.windows.net/.default" \
+  -d "grant_type=client_credentials" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  --data-urlencode "client_assertion=$(cat $AZURE_FEDERATED_TOKEN_FILE)" \
+  | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
