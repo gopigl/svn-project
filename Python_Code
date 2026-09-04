@@ -113,11 +113,37 @@ public class DbTest {
         Properties props = new Properties();
         props.setProperty("accessToken", System.getenv("TOKEN"));
 
+        String sql =
+            "SELECT SUSER_SNAME()    AS login_name, "
+          + "       USER_NAME()      AS db_user, "
+          + "       ORIGINAL_LOGIN() AS original_login, "
+          + "       DB_NAME()        AS database_name, "
+          + "       dp.type_desc     AS principal_type, "
+          + "       dp.authentication_type_desc AS auth_type, "
+          + "       TRY_CONVERT(uniqueidentifier, dp.sid) AS entra_client_id "
+          + "FROM sys.database_principals dp WHERE dp.name = USER_NAME()";
+
         try (Connection conn = DriverManager.getConnection(url, props);
-             ResultSet rs = conn.createStatement()
-                 .executeQuery("SELECT SUSER_SNAME(), DB_NAME()")) {
+             ResultSet rs = conn.createStatement().executeQuery(sql)) {
+
+            ResultSetMetaData md = rs.getMetaData();
             rs.next();
-            System.out.println("CONNECTED as " + rs.getString(1) + " on " + rs.getString(2));
+            System.out.println("CONNECTED");
+            for (int i = 1; i <= md.getColumnCount(); i++) {
+                System.out.printf("  %-16s : %s%n", md.getColumnLabel(i), rs.getString(i));
+            }
+
+            // database roles this user belongs to
+            System.out.println("  roles:");
+            try (ResultSet r2 = conn.createStatement().executeQuery(
+                    "SELECT r.name FROM sys.database_role_members rm "
+                  + "JOIN sys.database_principals r ON rm.role_principal_id = r.principal_id "
+                  + "JOIN sys.database_principals m ON rm.member_principal_id = m.principal_id "
+                  + "WHERE m.name = USER_NAME()")) {
+                boolean any = false;
+                while (r2.next()) { System.out.println("    - " + r2.getString(1)); any = true; }
+                if (!any) System.out.println("    <none>");
+            }
         }
     }
 }
