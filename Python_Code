@@ -102,194 +102,24 @@ spec:
 
 
 ========================
-#!/usr/bin/env python3
-"""
-Validate an Azure SQL / SQL Server connection from inside an AKS pod using
-Azure AD Workload Identity (no passwords, no connection secrets).
+import json, os, struct, urllib.parse, urllib.request, pyodbc
 
-Required env vars:
-    SQL_SERVER    e.g. myserver.database.windows.net
-    SQL_DATABASE  e.g. mydb
+body = urllib.parse.urlencode({
+    "client_id": os.environ["AZURE_CLIENT_ID"],
+    "scope": "https://database.windows.net/.default",
+    "grant_type": "client_credentials",
+    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    "client_assertion": open(os.environ["AZURE_FEDERATED_TOKEN_FILE"]).read(),
+}).encode()
 
-Optional:
-    SQL_QUERY     a custom query to run after the built-in checks
-    SQL_PORT      defaults to 1433
-    ODBC_DRIVER   defaults to "ODBC Driver 18 for SQL Server"
+url = f"{os.environ['AZURE_AUTHORITY_HOST']}{os.environ['AZURE_TENANT_ID']}/oauth2/v2.0/token"
+token = json.load(urllib.request.urlopen(urllib.request.Request(url, data=body)))["access_token"]
 
-Injected automatically by the workload identity webhook:
-    AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_AUTHORITY_HOST,
-    AZURE_FEDERATED_TOKEN_FILE
-"""
-
-import base64
-import json
-import os
-import struct
-import sys
-
-# ODBC connection attribute for passing a pre-fetched access token.
-# Defined in msodbcsql.h; pyodbc does not expose a constant for it.
-SQL_COPT_SS_ACCESS_TOKEN = 1256
-
-# The audience Azure SQL expects. Note: no trailing slash on the resource.
-SQL_SCOPE = "https://database.windows.net/.default"
-
-
-def section(title):
-    print(f"\n=== {title} ===", flush=True)
-
-
-def check_environment():
-    section("1. Workload identity environment")
-
-    expected = [
-        "AZURE_CLIENT_ID",
-        "AZURE_TENANT_ID",
-        "AZURE_AUTHORITY_HOST",
-        "AZURE_FEDERATED_TOKEN_FILE",
-    ]
-
-    missing = []
-    for name in expected:
-        value = os.getenv(name)
-        if value:
-            print(f"  {name} = {value}")
-        else:
-            print(f"  {name} = <MISSING>")
-            missing.append(name)
-
-    if missing:
-        print(
-            "\n  FAIL: the webhook did not inject credentials.\n"
-            "  Check that the pod has label azure.workload.identity/use: \"true\"\n"
-            "  and that the azure-wi-webhook pods are running in kube-system."
-        )
-        sys.exit(1)
-
-    token_file = os.getenv("AZURE_FEDERATED_TOKEN_FILE")
-    if not os.path.exists(token_file):
-        print(f"\n  FAIL: projected token file not found at {token_file}")
-        sys.exit(1)
-
-    size = os.path.getsize(token_file)
-    print(f"  projected token file present ({size} bytes)")
-
-
-def fetch_token():
-    section("2. Acquiring token for Azure SQL")
-
-    # WorkloadIdentityCredential rather than DefaultAzureCredential:
-    # it fails loudly instead of silently falling back to IMDS, which
-    # makes misconfiguration much easier to diagnose.
-    from azure.identity import WorkloadIdentityCredential
-
-    credential = WorkloadIdentityCredential()
-    token = credential.get_token(SQL_SCOPE)
-    print(f"  token acquired, expires_on = {token.expires_on}")
-
-    payload = token.token.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    claims = json.loads(base64.urlsafe_b64decode(payload))
-
-    print(f"  aud   = {claims.get('aud')}")
-    print(f"  appid = {claims.get('appid') or claims.get('azp')}")
-    print(f"  oid   = {claims.get('oid')}   <-- must match MI principal ID")
-    print(f"  tid   = {claims.get('tid')}")
-
-    return token.token
-
-
-def pack_token(access_token):
-    """Azure SQL's ODBC driver wants UTF-16-LE bytes with a 4-byte length prefix."""
-    token_bytes = access_token.encode("utf-16-le")
-    return struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
-
-
-def connect_and_query(access_token):
-    section("3. Connecting to the database")
-
-    import pyodbc
-
-    server = os.environ["SQL_SERVER"]
-    database = os.environ["SQL_DATABASE"]
-    port = os.getenv("SQL_PORT", "1433")
-    driver = os.getenv("ODBC_DRIVER", "ODBC Driver 18 for SQL Server")
-
-    print(f"  drivers available: {pyodbc.drivers()}")
-    print(f"  target: {server},{port} / {database}")
-
-    # No UID, PWD, or Authentication keyword here. Supplying any of them
-    # alongside an access token causes the driver to reject the connection.
-    conn_str = (
-        f"Driver={{{driver}}};"
-        f"Server=tcp:{server},{port};"
-        f"Database={database};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Connection Timeout=30;"
-    )
-
-    with pyodbc.connect(
-        conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: pack_token(access_token)}
-    ) as conn:
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT SUSER_SNAME(), DB_NAME(), SYSTEM_USER, @@VERSION"
-        )
-        login, db_name, system_user, version = cursor.fetchone()
-
-        print("\n  CONNECTED")
-        print(f"  authenticated as : {login}")
-        print(f"  system_user      : {system_user}")
-        print(f"  database         : {db_name}")
-        print(f"  server version   : {version.splitlines()[0].strip()}")
-
-        section("4. Effective permissions")
-        cursor.execute(
-            """
-            SELECT r.name
-            FROM sys.database_role_members rm
-            JOIN sys.database_principals r ON rm.role_principal_id = r.principal_id
-            JOIN sys.database_principals m ON rm.member_principal_id = m.principal_id
-            WHERE m.name = USER_NAME()
-            """
-        )
-        roles = [row[0] for row in cursor.fetchall()]
-        print(f"  database roles: {roles or '<none>'}")
-
-        custom_query = os.getenv("SQL_QUERY")
-        if custom_query:
-            section("5. Custom query")
-            print(f"  {custom_query}")
-            cursor.execute(custom_query)
-            if cursor.description:
-                columns = [c[0] for c in cursor.description]
-                print(f"  columns: {columns}")
-                for row in cursor.fetchmany(10):
-                    print(f"  {tuple(row)}")
-            else:
-                print(f"  rowcount: {cursor.rowcount}")
-
-
-def main():
-    for required in ("SQL_SERVER", "SQL_DATABASE"):
-        if not os.getenv(required):
-            print(f"FAIL: env var {required} is not set")
-            sys.exit(1)
-
-    check_environment()
-    token = fetch_token()
-
-    try:
-        connect_and_query(token)
-    except Exception as exc:  # noqa: BLE001 - this is a diagnostic script
-        print("\n  CONNECTION FAILED")
-        print(f"  {type(exc).__name__}: {exc}")
-        sys.exit(1)
-
-    print("\nALL CHECKS PASSED")
-
-
-if __name__ == "__main__":
-    main()
+tb = token.encode("utf-16-le")
+conn = pyodbc.connect(
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=test-db-ericsson.database.windows.net;"
+    "DATABASE=test-db01;Encrypt=yes;",
+    attrs_before={1256: struct.pack(f"<I{len(tb)}s", len(tb), tb)},
+)
+print(conn.cursor().execute("SELECT SUSER_SNAME(), @@VERSION").fetchone())
